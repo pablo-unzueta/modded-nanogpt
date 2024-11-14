@@ -638,7 +638,7 @@ for step in range(args.num_iterations + 1):
         p.grad /= train_accumulation_steps
     # momentum warmup for Muon
     frac = min(step / 500, 1)
-    optimizer3.param_groups[0]["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+    # optimizer3.param_groups[0]["momentum"] = (1 - frac) * 0.85 + frac * 0.95
     # step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):
         opt.step()
