@@ -528,7 +528,7 @@ optimizer2 = torch.optim.Adam(
 params = list(raw_model.transformer.h.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
 scalar_params = [p for p in params if p.ndim < 2]
-optimizer3 = torch.optim.Adam(matrix_params, lr=0.02, betas=(0.9, 0.95), fused=True)
+optimizer3 = torch.optim.Adam(matrix_params, lr=0.002, betas=(0.9, 0.95), fused=True)
 # optimizer3 = Muon(matrix_params, lr=0.02, momentum=0.95)
 optimizer4 = torch.optim.Adam(
     scalar_params, lr=0.02, betas=(0.9, 0.95), fused=True
