@@ -193,8 +193,8 @@ class GPT(nn.Module):
         # Detailed validation
         max_token = torch.max(idx).item()
         min_token = torch.min(idx).item()
-        print(f"Input tokens - shape: {idx.shape}, max: {max_token}, min: {min_token}")
-        print(f"Embedding layer size: {self.transformer.wte.weight.shape}")
+        # print(f"Input tokens - shape: {idx.shape}, max: {max_token}, min: {min_token}")
+        # print(f"Embedding layer size: {self.transformer.wte.weight.shape}")
 
         if max_token >= self.config.vocab_size:
             raise ValueError(
@@ -340,8 +340,8 @@ class DistributedDataLoader:
         T = self.T
         try:
             buf = self.tokens[self.current_position : self.current_position + B * T + 1]
-            print(f"Loading batch from position {self.current_position}")
-            print(f"Buffer shape: {buf.shape}, max: {np.max(buf)}, min: {np.min(buf)}")
+            # print(f"Loading batch from position {self.current_position}")
+            # print(f"Buffer shape: {buf.shape}, max: {np.max(buf)}, min: {np.min(buf)}")
 
             if len(buf) < B * T + 1:
                 print(
