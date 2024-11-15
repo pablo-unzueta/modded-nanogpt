@@ -187,11 +187,18 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
+        
+        # Add validation checks
+        max_token = torch.max(idx).item()
+        if max_token >= self.config.vocab_size:
+            raise ValueError(f"Input contains token {max_token} which is >= vocab_size {self.config.vocab_size}")
+        
         assert (
             t <= self.config.sequence_length
-        ), f"Cannot forward longer sequence ({t=}) than model can handle"
-        pos = torch.arange(0, t, dtype=torch.long, device=device)  # shape (t)
-
+        ), f"Cannot forward longer sequence ({t=}) than model can handle ({self.config.sequence_length})"
+        
+        pos = torch.arange(0, t, dtype=torch.long, device=device)
+        
         tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos).unsqueeze(
             0
