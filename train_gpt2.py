@@ -392,7 +392,7 @@ class Hyperparameters:
     )
     # optimization hyperparams
     batch_size: int = 8 * 64  # batch size, in sequences, across all devices
-    device_batch_size: int = 32  # batch size, in sequences, per device
+    device_batch_size: int = 16  # batch size, in sequences, per device
     sequence_length: int = 1024  # sequence length, in tokens
     num_iterations: int = 3242  # number of iterations to run
     warmup_iters: int = 0
