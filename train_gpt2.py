@@ -1,6 +1,8 @@
 import os
 import sys
 
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
 with open(sys.argv[0]) as f:
     code = f.read()  # read the code of this file ASAP, for logging
 import uuid
@@ -191,10 +193,12 @@ class GPT(nn.Module):
         pos = torch.arange(0, t, dtype=torch.long, device=device)  # shape (t)
 
         tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos)  # position embeddings of shape (t, n_embd)
+        pos_emb = self.transformer.wpe(pos).unsqueeze(
+            0
+        )  # position embeddings of shape (t, n_embd)
         x = tok_emb + pos_emb
         x = self.transformer.drop(x)
-        for block in self.transfomer.h:
+        for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
 
