@@ -240,6 +240,7 @@ class GPT(nn.Module):
 @dataclass
 class GPTConfig:
     vocab_size: int = 50304
+    sequence_length: int = 1024
     n_layer: int = 12
     n_head: int = 6  # head dim 128 suggested by @Grad62304977
     n_embd: int = 768
