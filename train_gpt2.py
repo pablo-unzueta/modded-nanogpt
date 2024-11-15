@@ -489,7 +489,7 @@ x, y = train_loader.next_batch()
 
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
-global num_vocab = 50304
+num_vocab = 50257
 config = GPTConfig()
 print(f"Creating model with config:")
 print(f"vocab_size: {config.vocab_size}")
