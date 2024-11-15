@@ -499,6 +499,7 @@ print(f"n_head: {config.n_head}")
 print(f"n_embd: {config.n_embd}")
 model = GPT(config)
 # model = model.to(args.device).bfloat16()
+model = model.to(args.device)
 
 # here we wrap model into DDP container
 model = DDP(model, device_ids=[ddp_local_rank])
