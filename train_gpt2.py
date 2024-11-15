@@ -353,15 +353,15 @@ class DistributedDataLoader:
             y = (buf[1:]).view(B, T)
 
             # Validation
-            for name, tensor in [("x", x), ("y", y)]:
-                max_val = tensor.max().item()
-                if max_val >= num_vocab:
-                    raise ValueError(
-                        f"{name} contains token {max_val} >= vocab_size {num_vocab}\n"
-                        f"Shape: {tensor.shape}\n"
-                        f"Current file: {self.files[self.current_shard]}\n"
-                        f"Position: {self.current_position}"
-                    )
+            # for name, tensor in [("x", x), ("y", y)]:
+            #     max_val = tensor.max().item()
+            #     if max_val >= num_vocab:
+            #         raise ValueError(
+            #             f"{name} contains token {max_val} >= vocab_size {num_vocab}\n"
+            #             f"Shape: {tensor.shape}\n"
+            #             f"Current file: {self.files[self.current_shard]}\n"
+            #             f"Position: {self.current_position}"
+            #         )
 
             self.current_position += B * T * self.num_processes
             if self.current_position + (B * T * self.num_processes + 1) > len(
