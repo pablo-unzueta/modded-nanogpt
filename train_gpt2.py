@@ -261,7 +261,7 @@ class GPTConfig:
     n_head: int = 6
     n_embd: int = 768
     dropout: float = 0.0
-    bias: bool = False
+    bias: bool = True
 
 
 # -----------------------------------------------------------------------------
