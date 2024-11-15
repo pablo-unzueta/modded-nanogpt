@@ -447,7 +447,7 @@ model = model.to(args.device).bfloat16()
 model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module  # always contains the "raw" unwrapped model
 # optimizer
-optimizer = model.configure_optimizers(
+optimizer = raw_model.configure_optimizers(
     args.weight_decay, args.learning_rate, (args.beta1, args.beta2), args.device
 )
 checkpoint = None  # free up memory
