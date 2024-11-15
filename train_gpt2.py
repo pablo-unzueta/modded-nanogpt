@@ -501,6 +501,9 @@ model = GPT(config)
 # model = model.to(args.device).bfloat16()
 model = model.to(args.device)
 
+# Compile model with torch.compile()
+model = torch.compile(model)
+
 # here we wrap model into DDP container
 model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module  # always contains the "raw" unwrapped model
