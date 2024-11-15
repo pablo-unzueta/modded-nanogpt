@@ -8,6 +8,7 @@ import glob
 import time
 from dataclasses import dataclass
 
+import math
 import numpy as np
 import torch
 from torch import nn
@@ -15,264 +16,120 @@ import torch.nn.functional as F
 import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
+import inspect
 
-# -----------------------------------------------------------------------------
-# Muon optimizer
-
-
-def zeropower_via_svd(G, steps=None):
-    U, S, V = G.svd()
-    return U @ V.T
-
-
-@torch.compile
-def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
-    r"""
-    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
-    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
-    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
-    zero even beyond the point where the iteration no longer converges all the way to one everywhere
-    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
-    where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
-    performance at all relative to UV^T, where USV^T = G is the SVD.
-    """
-    assert len(G.shape) == 2
-    a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.bfloat16()
-    X /= X.norm() + eps  # ensure top singular value <= 1
-    if G.size(0) > G.size(1):
-        X = X.T
-    for _ in range(steps):
-        A = X @ X.T
-        B = (
-            b * A + c * A @ A
-        )  # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
-        X = a * X + B @ X
-    if G.size(0) > G.size(1):
-        X = X.T
-    return X
-
-
-zeropower_backends = dict(
-    svd=zeropower_via_svd, newtonschulz5=zeropower_via_newtonschulz5
-)
-
-
-class Muon(torch.optim.Optimizer):
-    """
-    Muon - MomentUm Orthogonalized by Newton-schulz
-
-    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
-    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
-    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
-    the advantage that it can be stably run in bfloat16 on the GPU.
-
-    Some warnings:
-    - This optimizer assumes that all parameters passed in are 2D.
-    - It should not be used for the embedding layer, the final fully connected layer, or any {0,1}-D
-    parameters; those should all be optimized by a standard method (e.g., AdamW).
-    - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
-    - We believe it is unlikely to work well for training with small batch size.
-    - We believe it may not work well for finetuning pretrained models, but we haven't tested this.
-    - We have not yet tried this optimizer for training scenarios larger than NanoGPT (124M).
-
-    Arguments:
-        lr: The learning rate used by the internal SGD.
-        momentum: The momentum used by the internal SGD.
-        nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
-        backend: The chosen backend for the orthogonalization step. (recommended: 'newtonschulz5')
-        backend_steps: The number of iteration steps to use in the backend, if it is iterative.
-    """
-
-    def __init__(
-        self,
-        params,
-        lr=0.02,
-        momentum=0.95,
-        nesterov=True,
-        backend="newtonschulz5",
-        backend_steps=5,
-    ):
-        defaults = dict(
-            lr=lr,
-            momentum=momentum,
-            nesterov=nesterov,
-            backend=backend,
-            backend_steps=backend_steps,
-        )
-        super().__init__(params, defaults)
-
-    def step(self):
-        for group in self.param_groups:
-            lr = group["lr"]
-            momentum = group["momentum"]
-            zeropower_backend = zeropower_backends[group["backend"]]
-
-            # generate weight updates in distributed fashion
-            total_params = sum(p.numel() for p in group["params"])
-            updates_flat = torch.zeros(
-                total_params, device="cuda", dtype=torch.bfloat16
-            )
-            curr_idx = 0
-            for i, p in enumerate(group["params"]):
-                # luckily this will perfectly distribute a transformer with multiple of 4 layers to 8 GPUs
-                if i % int(os.environ["WORLD_SIZE"]) == int(os.environ["RANK"]):
-                    g = p.grad
-                    assert g is not None
-                    state = self.state[p]
-                    if "momentum_buffer" not in state:
-                        state["momentum_buffer"] = torch.zeros_like(g)
-                    buf = state["momentum_buffer"]
-                    buf.mul_(momentum).add_(g)
-                    if group["nesterov"]:
-                        g = g.add(buf, alpha=momentum)
-                    g = zeropower_backend(g, steps=group["backend_steps"])
-                    g *= max(1, g.size(0) / g.size(1)) ** 0.5
-                    updates_flat[curr_idx : curr_idx + p.numel()] = g.flatten()
-                curr_idx += p.numel()
-
-            # sync updates across devices. we are not memory-constrained so can do this simple deserialization
-            dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
-
-            # deserialize and apply updates
-            curr_idx = 0
-            for p in group["params"]:
-                g = (
-                    updates_flat[curr_idx : curr_idx + p.numel()]
-                    .view_as(p.data)
-                    .type_as(p.data)
-                )
-                p.data.add_(g, alpha=-lr)
-                curr_idx += p.numel()
-
-
-# -----------------------------------------------------------------------------
-# PyTorch nn.Module definitions for the GPT-2 model
-
-
-class Rotary(torch.nn.Module):
-    def __init__(self, dim, base=10000):
-        super().__init__()
-        self.dim = dim
-        self.base = base
-        self.inv_freq = None
-        self.seq_len_cached = None
-        self.cos_cached = None
-        self.sin_cached = None
-
-    def forward(self, x):
-        seq_len = x.shape[1]
-        if seq_len != self.seq_len_cached:
-            self.inv_freq = 1.0 / (
-                self.base
-                ** (torch.arange(0, self.dim, 2, device=x.device).float() / self.dim)
-            )
-            self.seq_len_cached = seq_len
-            t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
-            freqs = torch.outer(t, self.inv_freq)
-            self.cos_cached = freqs.cos().bfloat16()
-            self.sin_cached = freqs.sin().bfloat16()
-        return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
-
-
-def apply_rotary_emb(x, cos, sin):
-    assert x.ndim == 4  # multihead attention
-    d = x.shape[3] // 2
-    x1 = x[..., :d]
-    x2 = x[..., d:]
-    y1 = x1 * cos + x2 * sin
-    y2 = x1 * (-sin) + x2 * cos
-    return torch.cat([y1, y2], 3).type_as(x)
-
-
-class CastedLinear(nn.Linear):
-    def forward(self, x):
-        return F.linear(x, self.weight.to(x.dtype))
-
-
-class CausalSelfAttention(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.head_dim = self.n_embd // self.n_head
-        assert self.n_embd % self.n_head == 0
-        self.c_q = CastedLinear(self.n_embd, self.n_embd, bias=False)
-        self.c_k = CastedLinear(self.n_embd, self.n_embd, bias=False)
-        self.c_v = CastedLinear(self.n_embd, self.n_embd, bias=False)
-        # output projection
-        self.c_proj = CastedLinear(self.n_embd, self.n_embd, bias=False)
-        self.c_proj.weight.data.zero_()  # zero init suggested by @Grad62304977
-        self.rotary = Rotary(self.head_dim)
-        self.lamb = nn.Parameter(torch.tensor(0.5))  # @Grad62304977
-
-    def forward(self, x, v1=None):
-        B, T, C = (
-            x.size()
-        )  # batch size, sequence length, embedding dimensionality (n_embd)
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_head, self.head_dim)
-        if v1 is None:
-            v1 = v  # This happens if we are in the first block. v needs to be accessed by subsequent blocks
-        v = (1 - self.lamb) * v + self.lamb * v1.view_as(v)  # @Grad62304977
-        cos, sin = self.rotary(q)
-        q, k = (
-            F.rms_norm(q, (q.size(-1),)),
-            F.rms_norm(k, (k.size(-1),)),
-        )  # QK norm suggested by @Grad62304977
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        y = F.scaled_dot_product_attention(
-            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True
-        )
-        y = (
-            y.transpose(1, 2).contiguous().view_as(x)
-        )  # re-assemble all head outputs side by side
-        y = self.c_proj(y)
-        return y, v1
-
-
-class MLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.c_fc = CastedLinear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = CastedLinear(4 * config.n_embd, config.n_embd, bias=False)
-        self.c_proj.weight.data.zero_()  # zero init suggested by @Grad62304977
-
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(
-            x
-        ).square()  # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
-        x = self.c_proj(x)
-        return x
+# Original Code from Karpathy's NanoGPT
+# https://github.com/karpathy/nanoGPT/blob/master/model.py
 
 
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
+        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
-        self.lambdas = nn.Parameter(torch.tensor([1.0, 0.0]))
 
-    def forward(self, x, v1, x0):
-        x = self.lambdas[0] * x + self.lambdas[1] * x0
-        x1, v1 = self.attn(F.rms_norm(x, (x.size(-1),)), v1)
-        x = x + x1
-        x = x + self.mlp(F.rms_norm(x, (x.size(-1),)))
-        return x, v1
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
+        return x
 
 
-# -----------------------------------------------------------------------------
-# The main GPT-2 model
+class MLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.gelu = nn.GELU()
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = self.gelu(x)
+        x = self.c_proj(x)
+        x = self.dropout(x)
+        return x
 
 
-@dataclass
-class GPTConfig:
-    vocab_size: int = 50304
-    n_layer: int = 12
-    n_head: int = 6  # head dim 128 suggested by @Grad62304977
-    n_embd: int = 768
+class LayerNorm(nn.Module):
+    "LayerNorm with optional bias."
+
+    def __init__(self, ndim, bias):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(ndim))
+        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+
+    def forward(self, input):
+        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        # k, q, v projections for all heads, but in a batch
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        # output projection
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        # regularization
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+        self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention")
+        if not self.flash:
+            print(
+                "WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0"
+            )
+            # causal mask to ensure that attention is only applied to the left in the input sequence
+            self.register_buffer(
+                "bias",
+                torch.tril(torch.ones(config.block_size, config.block_size)).view(
+                    1, 1, config.block_size, config.block_size
+                ),
+            )
+
+    def forward(self, x):
+        B, T, C = x.size()  # batch size, seq. length, and embedding dimensionality
+
+        # calc q, k, v for all heads in batch and move head forward to the batch dim
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(
+            1, 2
+        )  # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(
+            1, 2
+        )  # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(
+            1, 2
+        )  # (B, nh, T, hs)
+
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        if self.flash:
+            # efficient attention using Flash Attention CUDA kernels
+            y = torch.nn.functional.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=None,
+                dropout_p=self.dropout if self.training else 0,
+                is_causal=True,
+            )
+        else:  # manual implementation of attention
+            att = (q * k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+            att = F.softmax(att, dim=-1)
+            att = self.attn_dropout(att)
+            y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
+        y = (
+            y.transpose(1, 2).contiguous().view(B, T, C)
+        )  # re-assemble all head outputs side by side
+
+        y = self.resid_dropout(self.c_proj(y))
+        return y
 
 
 class GPT(nn.Module):
@@ -283,27 +140,109 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(config.vocab_size, config.n_embd),
-                h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+                wpe=nn.Embedding(config.sequence_length, config.n_embd),
+                drop=nn.Dropout(config.dropout),
+                h=nn.ModuleList([Block(config) for _ in range(config.n_layers)]),
+                ln_f=LayerNorm(config.n_embd, bias=config.bias),
             )
         )
-        self.lm_head = CastedLinear(config.n_embd, config.vocab_size, bias=False)
-        self.lm_head.weight.data.zero_()  # @Grad62304977
+        self.lm_head = nn.Linear(config.n_embd, config.sequence_length, bias=False)
+        self.transformer.wte.weight = (
+            self.lm_head.weight
+        )  # weight tying https://paperswithcode.com/method/weight-tying
 
-    def forward(self, idx, target):
-        # forward the GPT model itself
-        x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
-        x = F.rms_norm(x, (x.size(-1),))  # @Grad62304977
-        x0 = x
-        v1 = None
-        for block in self.transformer.h:
-            x, v1 = block(x, v1, x0)
-        x = F.rms_norm(x, (x.size(-1),))
+        # init all weights
+        self.apply(self._init_weights)
+        # apply special scaled init to the residual projections, per GPT-2 paper
+        for pn, p in self.named_parameters():
+            if pn.endswith("c_proj.weight"):
+                torch.nn.init.normal_(
+                    p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layers)
+                )
+        # report number of parameters
+        print("number of parameters: %.2fM" % (self.get_num_params() / 1e6,))
 
-        logits = self.lm_head(x)
-        logits = 30 * torch.tanh(logits / 30)  # @Grad62304977
-        logits = logits.float()
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1))
-        return loss.float()
+        def get_num_params(self, non_embedding=True):
+            """
+            Return the number of parameters in the model.
+            For non-embedding count (default), the position embeddings get subtracted.
+            The token embeddings would too, except due to the parameter sharing these
+            params are actually used as weights in the final layer, so we include them.
+            """
+            n_params = sum(p.numel() for p in self.parameters())
+            if non_embedding:
+                n_params -= self.transformer.wpe.weight.numel()
+            return n_params
+
+        def _init_weights(self, module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                if module.bias is not None:
+                    torch.nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Embedding):
+                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+        def forward(self, idx, targets=None):
+            device = idx.device
+            b, t = idx.size()
+            assert (
+                t <= self.config.sequence_length
+            ), f"Cannot forward longer sequence ({t=}) than model can handle"
+            pos = torch.arange(0, t, dtype=torch.long, device=device)  # shape (t)
+
+            tok_emb = self.transformer.wte(
+                idx
+            )  # token embeddings of shape (b, t, n_embd)
+            pos_emb = self.transformer.wpe(
+                pos
+            )  # position embeddings of shape (t, n_embd)
+            x = tok_emb + pos_emb
+            x = self.transformer.drop(x)
+            for block in self.transfomer.h:
+                x = block(x)
+            x = self.transformer.ln_f(x)
+
+            logits = self.lm_head(x)
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
+            )
+            return loss.float()
+
+        def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+            param_dict = {pn: p for pn, p in self.named_parameters()}
+            # filter out those that don't require grad
+            param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+            # create optim groups. Any params that are 2D will be weight decayed, otherwise no.
+            decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+            nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+            optim_groups = [
+                {"params": decay_params, "weight_decay": weight_decay},
+                {"params": nodecay_params, "weight_decay": 0.0},
+            ]
+            num_decay_params = sum(p.numel() for p in decay_params)
+            num_nodecay_params = sum(p.numel() for p in nodecay_params)
+            print(
+                f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters"
+            )
+            print(
+                f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters"
+            )
+            # Create AdamW optimizer and use the fused version if needed
+            fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
+            use_fused = fused_available and device_type == "cuda"
+            extra_args = dict(fused=True) if use_fused else dict()
+            optimizer = torch.optim.AdamW(
+                optim_groups, lr=learning_rate, betas=betas, **extra_args
+            )
+            return optimizer
+
+
+@dataclass
+class GPTConfig:
+    vocab_size: int = 50304
+    n_layer: int = 12
+    n_head: int = 6  # head dim 128 suggested by @Grad62304977
+    n_embd: int = 768
 
 
 # -----------------------------------------------------------------------------
@@ -418,6 +357,15 @@ class Hyperparameters:
     save_every: int = (
         0  # every how many steps to save the checkpoint? 0 for only at the end
     )
+    # adamw optimizer
+    learning_rate = 6e-4  # max learning rate
+    weight_decay = 1e-1
+    beta1 = 0.9
+    beta2 = 0.95
+    grad_clip = 1.0  # clip gradients at this value, or disable if == 0.0
+    # learning rate decay settings
+    decay_lr = True  # whether to decay the learning rate
+    device: str = "cuda"
 
 
 args = Hyperparameters()
@@ -494,46 +442,45 @@ x, y = train_loader.next_batch()
 # this originates from Karpathy's experiments.
 num_vocab = 50304
 model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
-model = model.cuda().bfloat16()
-for m in model.modules():
-    if isinstance(m, CastedLinear):
-        m.float()
-if hasattr(config, "coordinate_descent_tuning"):
-    config.coordinate_descent_tuning = True  # suggested by @Chillee
-model = torch.compile(model)
+model = model.to(args.device).bfloat16()
+
 # here we wrap model into DDP container
 model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module  # always contains the "raw" unwrapped model
-
-# CUDNN attention is ~4ms faster than Flash, but doesn't get selected by default in PyTorch 2.5.1
-from torch.backends.cuda import (
-    enable_cudnn_sdp,
-    enable_flash_sdp,
-    enable_math_sdp,
-    enable_mem_efficient_sdp,
+# optimizer
+optimizer = model.configure_optimizers(
+    args.weight_decay, args.learning_rate, (args.beta1, args.beta2), args.device
 )
+checkpoint = None  # free up memory
+# CUDNN attention is ~4ms faster than Flash, but doesn't get selected by default in PyTorch 2.5.1
+# from torch.backends.cuda import (
+#     enable_cudnn_sdp,
+#     enable_flash_sdp,
+#     enable_math_sdp,
+#     enable_mem_efficient_sdp,
+# )
 
-enable_cudnn_sdp(True)
-enable_flash_sdp(False)
-enable_mem_efficient_sdp(False)
-enable_math_sdp(False)
+# enable_cudnn_sdp(True)
+# enable_flash_sdp(False)
+# enable_mem_efficient_sdp(False)
+# enable_math_sdp(False)
 
 # init the optimizer(s)
-optimizer1 = torch.optim.Adam(
-    [raw_model.transformer.wte.weight], lr=0.3, betas=(0.9, 0.95), fused=True
-)
-optimizer2 = torch.optim.Adam(
-    [raw_model.lm_head.weight], lr=0.002, betas=(0.9, 0.95), fused=True
-)
-params = list(raw_model.transformer.h.parameters())
-matrix_params = [p for p in params if p.ndim == 2]
-scalar_params = [p for p in params if p.ndim < 2]
-optimizer3 = torch.optim.Adam(matrix_params, lr=0.001, betas=(0.9, 0.95), fused=True)
-# optimizer3 = Muon(matrix_params, lr=0.02, momentum=0.95)
-optimizer4 = torch.optim.Adam(
-    scalar_params, lr=0.02, betas=(0.9, 0.95), fused=True
-)  # note that this learning rate is neither sensitive nor tuned
-optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
+# optimizer1 = torch.optim.Adam(
+#     [raw_model.transformer.wte.weight], lr=0.3, betas=(0.9, 0.95), fused=True
+# )
+# optimizer2 = torch.optim.Adam(
+#     [raw_model.lm_head.weight], lr=0.002, betas=(0.9, 0.95), fused=True
+# )
+# params = list(raw_model.transformer.h.parameters())
+# matrix_params = [p for p in params if p.ndim == 2]
+# scalar_params = [p for p in params if p.ndim < 2]
+# optimizer3 = torch.optim.Adam(matrix_params, lr=0.001, betas=(0.9, 0.95), fused=True)
+# # optimizer3 = Muon(matrix_params, lr=0.02, momentum=0.95)
+# optimizer4 = torch.optim.Adam(
+#     scalar_params, lr=0.02, betas=(0.9, 0.95), fused=True
+# )  # note that this learning rate is neither sensitive nor tuned
+# optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
 
 
 # learning rate decay scheduler (linear warmup and warmdown)
@@ -551,7 +498,7 @@ def get_lr(it):
         return decay_ratio
 
 
-schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
+schedulers = [torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)]
 
 # Start training loop
 training_time_ms = 0
@@ -606,7 +553,7 @@ for step in range(args.num_iterations + 1):
             step=step,
             code=code,
             model=raw_model.state_dict(),
-            optimizers=[opt.state_dict() for opt in optimizers],
+            optimizer=optimizer.state_dict(),
         )
         torch.save(log, "logs/%s/state_step%06d.pt" % (run_id, step))
         # start the clock again
@@ -636,15 +583,12 @@ for step in range(args.num_iterations + 1):
             loss.backward()  # just sync on the last step
     for p in model.parameters():
         p.grad /= train_accumulation_steps
-    # momentum warmup for Muon
-    frac = min(step / 500, 1)
-    # optimizer3.param_groups[0]["momentum"] = (1 - frac) * 0.85 + frac * 0.95
     # step the optimizers and schedulers
-    for opt, sched in zip(optimizers, schedulers):
-        opt.step()
-        sched.step()
+    optimizer.step()
+    schedulers.step()
     # null the gradients
     model.zero_grad(set_to_none=True)
+
     # --------------- TRAINING SECTION END -------------------
     # everything that follows now is just diagnostics, prints, logging, etc.
 
