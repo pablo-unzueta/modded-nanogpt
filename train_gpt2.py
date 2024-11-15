@@ -140,6 +140,9 @@ class GPT(nn.Module):
         super().__init__()
         self.config = config
 
+        print(f"Initializing GPT with vocab_size: {config.vocab_size}")
+        print(f"Sequence length: {config.sequence_length}")
+
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(config.vocab_size, config.n_embd),
@@ -149,10 +152,8 @@ class GPT(nn.Module):
                 ln_f=LayerNorm(config.n_embd, bias=config.bias),
             )
         )
-        self.lm_head = nn.Linear(config.n_embd, config.sequence_length, bias=False)
-        self.transformer.wte.weight = (
-            self.lm_head.weight
-        )  # weight tying https://paperswithcode.com/method/weight-tying
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.transformer.wte.weight = self.lm_head.weight
 
         # init all weights
         self.apply(self._init_weights)
@@ -189,16 +190,21 @@ class GPT(nn.Module):
         device = idx.device
         b, t = idx.size()
 
-        # Add validation checks
+        # Detailed validation
         max_token = torch.max(idx).item()
+        min_token = torch.min(idx).item()
+        print(f"Input tokens - shape: {idx.shape}, max: {max_token}, min: {min_token}")
+        print(f"Embedding layer size: {self.transformer.wte.weight.shape}")
+
         if max_token >= self.config.vocab_size:
             raise ValueError(
-                f"Input contains token {max_token} which is >= vocab_size {self.config.vocab_size}"
+                f"Token index {max_token} out of range (>= vocab_size {self.config.vocab_size})\n"
+                f"Shape of idx: {idx.shape}\n"
+                f"First few tokens: {idx[0, :10]}"
             )
 
-        assert (
-            t <= self.config.sequence_length
-        ), f"Cannot forward longer sequence ({t=}) than model can handle ({self.config.sequence_length})"
+        if min_token < 0:
+            raise ValueError(f"Negative token index found: {min_token}")
 
         pos = torch.arange(0, t, dtype=torch.long, device=device)
 
@@ -252,10 +258,10 @@ class GPTConfig:
     vocab_size: int = 50304
     sequence_length: int = 1024
     n_layer: int = 12
-    n_head: int = 6  # head dim 128 suggested by @Grad62304977
+    n_head: int = 6
     n_embd: int = 768
     dropout: float = 0.0
-    bias: bool = False  # False is better
+    bias: bool = False
 
 
 # -----------------------------------------------------------------------------
@@ -332,15 +338,45 @@ class DistributedDataLoader:
     def next_batch(self):
         B = self.B
         T = self.T
-        buf = self.tokens[self.current_position : self.current_position + B * T + 1]
-        buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
-        x = (buf[:-1]).view(B, T)  # inputs
-        y = (buf[1:]).view(B, T)  # targets
-        # advance current position and load next shard if necessary
-        self.current_position += B * T * self.num_processes
-        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
-            self.advance()
-        return x.cuda(), y.cuda()
+        try:
+            buf = self.tokens[self.current_position : self.current_position + B * T + 1]
+            print(f"Loading batch from position {self.current_position}")
+            print(f"Buffer shape: {buf.shape}, max: {np.max(buf)}, min: {np.min(buf)}")
+
+            if len(buf) < B * T + 1:
+                print(
+                    f"Warning: Buffer size {len(buf)} is less than expected {B * T + 1}"
+                )
+
+            buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
+            x = (buf[:-1]).view(B, T)
+            y = (buf[1:]).view(B, T)
+
+            # Validation
+            for name, tensor in [("x", x), ("y", y)]:
+                max_val = tensor.max().item()
+                if max_val >= num_vocab:
+                    raise ValueError(
+                        f"{name} contains token {max_val} >= vocab_size {num_vocab}\n"
+                        f"Shape: {tensor.shape}\n"
+                        f"Current file: {self.files[self.current_shard]}\n"
+                        f"Position: {self.current_position}"
+                    )
+
+            self.current_position += B * T * self.num_processes
+            if self.current_position + (B * T * self.num_processes + 1) > len(
+                self.tokens
+            ):
+                self.advance()
+
+            return x.cuda(), y.cuda()
+
+        except Exception as e:
+            print(f"Error in next_batch:")
+            print(f"Current position: {self.current_position}")
+            print(f"Current shard: {self.files[self.current_shard]}")
+            print(f"Tokens shape: {self.tokens.shape}")
+            raise e
 
 
 # -----------------------------------------------------------------------------
@@ -454,7 +490,14 @@ x, y = train_loader.next_batch()
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
 num_vocab = 50304
-model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
+config = GPTConfig()
+print(f"Creating model with config:")
+print(f"vocab_size: {config.vocab_size}")
+print(f"sequence_length: {config.sequence_length}")
+print(f"n_layer: {config.n_layer}")
+print(f"n_head: {config.n_head}")
+print(f"n_embd: {config.n_embd}")
+model = GPT(config)
 model = model.to(args.device).bfloat16()
 
 # here we wrap model into DDP container
