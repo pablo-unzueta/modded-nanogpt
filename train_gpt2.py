@@ -489,7 +489,7 @@ x, y = train_loader.next_batch()
 
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
-num_vocab = 50257
+num_vocab = 50304
 config = GPTConfig()
 print(f"Creating model with config:")
 print(f"vocab_size: {config.vocab_size}")
@@ -498,7 +498,7 @@ print(f"n_layer: {config.n_layer}")
 print(f"n_head: {config.n_head}")
 print(f"n_embd: {config.n_embd}")
 model = GPT(config)
-model = model.to(args.device).bfloat16()
+# model = model.to(args.device).bfloat16()
 
 # here we wrap model into DDP container
 model = DDP(model, device_ids=[ddp_local_rank])
