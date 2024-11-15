@@ -80,18 +80,19 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention")
-        if not self.flash:
-            print(
-                "WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0"
-            )
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer(
-                "bias",
-                torch.tril(torch.ones(config.block_size, config.block_size)).view(
-                    1, 1, config.block_size, config.block_size
-                ),
-            )
+        self.flash = False
+        # self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention")
+        # if not self.flash:
+        #     print(
+        #         "WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0"
+        #     )
+        #     # causal mask to ensure that attention is only applied to the left in the input sequence
+        #     self.register_buffer(
+        #         "bias",
+        #         torch.tril(torch.ones(config.block_size, config.block_size)).view(
+        #             1, 1, config.block_size, config.block_size
+        #         ),
+        #     )
 
     def forward(self, x):
         B, T, C = x.size()  # batch size, seq. length, and embedding dimensionality
@@ -187,18 +188,20 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
-        
+
         # Add validation checks
         max_token = torch.max(idx).item()
         if max_token >= self.config.vocab_size:
-            raise ValueError(f"Input contains token {max_token} which is >= vocab_size {self.config.vocab_size}")
-        
+            raise ValueError(
+                f"Input contains token {max_token} which is >= vocab_size {self.config.vocab_size}"
+            )
+
         assert (
             t <= self.config.sequence_length
         ), f"Cannot forward longer sequence ({t=}) than model can handle ({self.config.sequence_length})"
-        
+
         pos = torch.arange(0, t, dtype=torch.long, device=device)
-        
+
         tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos).unsqueeze(
             0
