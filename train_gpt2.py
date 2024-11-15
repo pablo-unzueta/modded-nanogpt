@@ -162,53 +162,53 @@ class GPT(nn.Module):
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params() / 1e6,))
 
-        def get_num_params(self, non_embedding=True):
-            """
-            Return the number of parameters in the model.
-            For non-embedding count (default), the position embeddings get subtracted.
-            The token embeddings would too, except due to the parameter sharing these
-            params are actually used as weights in the final layer, so we include them.
-            """
-            n_params = sum(p.numel() for p in self.parameters())
-            if non_embedding:
-                n_params -= self.transformer.wpe.weight.numel()
-            return n_params
+    def get_num_params(self, non_embedding=True):
+        """
+        Return the number of parameters in the model.
+        For non-embedding count (default), the position embeddings get subtracted.
+        The token embeddings would too, except due to the parameter sharing these
+        params are actually used as weights in the final layer, so we include them.
+        """
+        n_params = sum(p.numel() for p in self.parameters())
+        if non_embedding:
+            n_params -= self.transformer.wpe.weight.numel()
+        return n_params
 
-        def _init_weights(self, module):
-            if isinstance(module, nn.Linear):
-                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-                if module.bias is not None:
-                    torch.nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.Embedding):
-                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-        def forward(self, idx, targets=None):
-            device = idx.device
-            b, t = idx.size()
-            assert (
-                t <= self.config.sequence_length
-            ), f"Cannot forward longer sequence ({t=}) than model can handle"
-            pos = torch.arange(0, t, dtype=torch.long, device=device)  # shape (t)
+    def forward(self, idx, targets=None):
+        device = idx.device
+        b, t = idx.size()
+        assert (
+            t <= self.config.sequence_length
+        ), f"Cannot forward longer sequence ({t=}) than model can handle"
+        pos = torch.arange(0, t, dtype=torch.long, device=device)  # shape (t)
 
-            tok_emb = self.transformer.wte(
-                idx
-            )  # token embeddings of shape (b, t, n_embd)
-            pos_emb = self.transformer.wpe(
-                pos
-            )  # position embeddings of shape (t, n_embd)
-            x = tok_emb + pos_emb
-            x = self.transformer.drop(x)
-            for block in self.transfomer.h:
-                x = block(x)
-            x = self.transformer.ln_f(x)
+        tok_emb = self.transformer.wte(
+            idx
+        )  # token embeddings of shape (b, t, n_embd)
+        pos_emb = self.transformer.wpe(
+            pos
+        )  # position embeddings of shape (t, n_embd)
+        x = tok_emb + pos_emb
+        x = self.transformer.drop(x)
+        for block in self.transfomer.h:
+            x = block(x)
+        x = self.transformer.ln_f(x)
 
-            logits = self.lm_head(x)
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
-            )
-            return loss.float()
+        logits = self.lm_head(x)
+        loss = F.cross_entropy(
+            logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
+        )
+        return loss.float()
 
-        def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
             param_dict = {pn: p for pn, p in self.named_parameters()}
             # filter out those that don't require grad
             param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
