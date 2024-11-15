@@ -157,7 +157,7 @@ class GPT(nn.Module):
         for pn, p in self.named_parameters():
             if pn.endswith("c_proj.weight"):
                 torch.nn.init.normal_(
-                    p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layers)
+                    p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer)
                 )
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params() / 1e6,))
@@ -190,12 +190,8 @@ class GPT(nn.Module):
         ), f"Cannot forward longer sequence ({t=}) than model can handle"
         pos = torch.arange(0, t, dtype=torch.long, device=device)  # shape (t)
 
-        tok_emb = self.transformer.wte(
-            idx
-        )  # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(
-            pos
-        )  # position embeddings of shape (t, n_embd)
+        tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
+        pos_emb = self.transformer.wpe(pos)  # position embeddings of shape (t, n_embd)
         x = tok_emb + pos_emb
         x = self.transformer.drop(x)
         for block in self.transfomer.h:
@@ -209,32 +205,32 @@ class GPT(nn.Module):
         return loss.float()
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-            param_dict = {pn: p for pn, p in self.named_parameters()}
-            # filter out those that don't require grad
-            param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-            # create optim groups. Any params that are 2D will be weight decayed, otherwise no.
-            decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-            nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-            optim_groups = [
-                {"params": decay_params, "weight_decay": weight_decay},
-                {"params": nodecay_params, "weight_decay": 0.0},
-            ]
-            num_decay_params = sum(p.numel() for p in decay_params)
-            num_nodecay_params = sum(p.numel() for p in nodecay_params)
-            print(
-                f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters"
-            )
-            print(
-                f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters"
-            )
-            # Create AdamW optimizer and use the fused version if needed
-            fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
-            use_fused = fused_available and device_type == "cuda"
-            extra_args = dict(fused=True) if use_fused else dict()
-            optimizer = torch.optim.AdamW(
-                optim_groups, lr=learning_rate, betas=betas, **extra_args
-            )
-            return optimizer
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        # filter out those that don't require grad
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any params that are 2D will be weight decayed, otherwise no.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": nodecay_params, "weight_decay": 0.0},
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(
+            f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters"
+        )
+        print(
+            f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters"
+        )
+        # Create AdamW optimizer and use the fused version if needed
+        fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == "cuda"
+        extra_args = dict(fused=True) if use_fused else dict()
+        optimizer = torch.optim.AdamW(
+            optim_groups, lr=learning_rate, betas=betas, **extra_args
+        )
+        return optimizer
 
 
 @dataclass
@@ -245,7 +241,7 @@ class GPTConfig:
     n_head: int = 6  # head dim 128 suggested by @Grad62304977
     n_embd: int = 768
     dropout: float = 0.0
-    bias: bool = False # False is better 
+    bias: bool = False  # False is better
 
 
 # -----------------------------------------------------------------------------
