@@ -245,6 +245,7 @@ class GPTConfig:
     n_head: int = 6  # head dim 128 suggested by @Grad62304977
     n_embd: int = 768
     dropout: float = 0.0
+    bias: bool = False # False is better 
 
 
 # -----------------------------------------------------------------------------
