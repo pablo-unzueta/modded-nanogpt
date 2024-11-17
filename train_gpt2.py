@@ -11,14 +11,56 @@ import time
 from dataclasses import dataclass
 
 import math
+from math import pi, log
 import numpy as np
 import torch
 from torch import nn
+from torch import Tensor
+from torch.amp import autocast
 import torch.nn.functional as F
 import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 import inspect
+from typing import Literal
+
+
+# Rotary
+# -----------------------------------------------------------------------------
+class Rotary(torch.nn.Module):
+    def __init__(self, dim, base: int = 10_000):
+        super().__init__()
+        self.dim = dim
+        self.base = base
+        self.inv_freq = None
+        self.seq_len_cached = None
+        self.cos_cached = None
+        self.sin_cached = None
+
+    def forward(self, x):
+        seq_len = x.shape[1]
+        if seq_len != self.seq_len_cached:
+            self.inv_freq = 1.0 / (
+                self.base ** (torch.arange(0, self.dim, 2).float() / self.dim)
+            )
+            self.seq_len_cached = seq_len
+            t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
+            freqs = torch.outer(t, self.inv_freq)
+            self.cos_cached = freqs.cos().bfloat16()
+            self.sin_cached = freqs.sin().bfloat16()
+
+        return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
+
+
+def apply_rotary_emb(x, cos, sin):
+    assert x.ndim == 4  # multihead attn
+    d = x.shape[3] // 2
+    x1 = x[..., :d]
+    x2 = x[..., d:]
+    y1 = x1 * cos + x2 * sin
+    y2 = x1 * (-sin) + x2 * cos
+    return torch.cat([y1, y2], 3).type_as(x)
+
 
 # Original Code from Karpathy's NanoGPT
 # https://github.com/karpathy/nanoGPT/blob/master/model.py
@@ -80,6 +122,8 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.lamb = nn.Parameter(torch.tensor(0.5))
+        self.rotary = Rotary(self.n_head)
         # self.flash = False
         self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention")
         if not self.flash:
@@ -94,7 +138,7 @@ class CausalSelfAttention(nn.Module):
                 ).view(1, 1, config.sequence_length, config.sequence_length),
             )
 
-    def forward(self, x):
+    def forward(self, x, v1=None):
         B, T, C = x.size()  # batch size, seq. length, and embedding dimensionality
 
         # calc q, k, v for all heads in batch and move head forward to the batch dim
@@ -108,6 +152,12 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(
             1, 2
         )  # (B, nh, T, hs)
+        if v1 is None:
+            v1 = v
+        v = (1 - self.lamb) * v + self.lamb * v1.view_as(v)
+        cos, sin = self.rotary(q)
+        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),))
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -132,7 +182,7 @@ class CausalSelfAttention(nn.Module):
         )  # re-assemble all head outputs side by side
 
         y = self.resid_dropout(self.c_proj(y))
-        return y
+        return y, v1
 
 
 class GPT(nn.Module):
@@ -146,10 +196,10 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(config.vocab_size, config.n_embd),
-                wpe=nn.Embedding(config.sequence_length, config.n_embd),
+                # wpe=nn.Embedding(config.sequence_length, config.n_embd),
                 drop=nn.Dropout(config.dropout),
-                h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-                ln_f=LayerNorm(config.n_embd, bias=config.bias),
+                # h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+                # ln_f=LayerNorm(config.n_embd, bias=config.bias),
             )
         )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -187,38 +237,16 @@ class GPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
-        device = idx.device
-        b, t = idx.size()
-
-        # Detailed validation
-        max_token = torch.max(idx)
-        min_token = torch.min(idx)
-        # print(f"Input tokens - shape: {idx.shape}, max: {max_token}, min: {min_token}")
-        # print(f"Embedding layer size: {self.transformer.wte.weight.shape}")
-
-        if max_token >= self.config.vocab_size:
-            raise ValueError(
-                f"Token index {max_token} out of range (>= vocab_size {self.config.vocab_size})\n"
-                f"Shape of idx: {idx.shape}\n"
-                f"First few tokens: {idx[0, :10]}"
-            )
-
-        if min_token < 0:
-            raise ValueError(f"Negative token index found: {min_token}")
-
-        pos = torch.arange(0, t, dtype=torch.long, device=device)
-
-        tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos).unsqueeze(
-            0
-        )  # position embeddings of shape (t, n_embd)
-        x = tok_emb + pos_emb
-        x = self.transformer.drop(x)
+        x = self.transformer.wte(idx)  # token embeddings (b, t, n_embd)
+        x = F.rms_norm(x, (x.size(-1),))
+        x0 = x
+        v1 = None
         for block in self.transformer.h:
-            x = block(x)
-        x = self.transformer.ln_f(x)
+            x, v1 = block(x, v1, x0)
+        x = F.rms_norm(x, (x.size(-1),))
 
         logits = self.lm_head(x)
+        # logits = 30 * torch.tanh(logits / 30)
         loss = F.cross_entropy(
             logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
         )
