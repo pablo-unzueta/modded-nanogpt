@@ -498,8 +498,7 @@ print(f"n_layer: {config.n_layer}")
 print(f"n_head: {config.n_head}")
 print(f"n_embd: {config.n_embd}")
 model = GPT(config)
-# model = model.to(args.device).bfloat16()
-model = model.to(args.device)
+model = model.to(args.device).bfloat16()
 
 # Compile model with torch.compile()
 model = torch.compile(model)
@@ -645,7 +644,8 @@ for step in range(args.num_iterations + 1):
         p.grad /= train_accumulation_steps
     # step the optimizers and schedulers
     optimizer.step()
-    schedulers.step()
+    for scheduler in schedulers:
+        scheduler.step()
     # null the gradients
     model.zero_grad(set_to_none=True)
 
