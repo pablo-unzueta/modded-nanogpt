@@ -41,15 +41,16 @@ class Rotary(torch.nn.Module):
         seq_len = x.shape[1]
         if seq_len != self.seq_len_cached:
             self.inv_freq = 1.0 / (
-                self.base ** (torch.arange(0, self.dim, 2).float() / self.dim)
-            )
+                self.base ** (torch.arange(0, self.dim // 2).float() / (self.dim // 2))
+            ).to(x.device)
             self.seq_len_cached = seq_len
             t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
             freqs = torch.outer(t, self.inv_freq)
-            self.cos_cached = freqs.cos().bfloat16()
-            self.sin_cached = freqs.sin().bfloat16()
+            emb = freqs.unsqueeze(0).unsqueeze(2)
+            self.cos_cached = emb.cos().bfloat16()
+            self.sin_cached = emb.sin().bfloat16()
 
-        return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
+        return self.cos_cached, self.sin_cached
 
 
 def apply_rotary_emb(x, cos, sin):
