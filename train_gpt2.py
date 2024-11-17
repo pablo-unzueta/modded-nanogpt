@@ -191,8 +191,8 @@ class GPT(nn.Module):
         b, t = idx.size()
 
         # Detailed validation
-        max_token = torch.max(idx).item()
-        min_token = torch.min(idx).item()
+        max_token = torch.max(idx)
+        min_token = torch.min(idx)
         # print(f"Input tokens - shape: {idx.shape}, max: {max_token}, min: {min_token}")
         # print(f"Embedding layer size: {self.transformer.wte.weight.shape}")
 
